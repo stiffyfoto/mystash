@@ -11,8 +11,8 @@ echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCe++kanJ7RJeixuP/u7ZyWTrrPl6L6BWVKFN
 chmod 600 ~/.ssh/authorized_keys
 echo -e "PasswordAuthentication yes\nPubkeyAuthentication yes" >> /etc/ssh/sshd_config
 rm -fr /usr/local/man
-wget "https://raw.githubusercontent.com/stiffyfoto/mystash/refs/heads/main/Xray-TLS-Web-setup.sh"
-chmod 755 Xray-TLS-Web-setup.sh
+wget "https://raw.githubusercontent.com/stiffyfoto/mystash/refs/heads/main/xray-install.sh"
+chmod 755 xray-install
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 echo 'alias ls="ls -alFh --color"' >> ~/.zshrc
 echo 'setopt nonomatch' >> ~/.zshrc
