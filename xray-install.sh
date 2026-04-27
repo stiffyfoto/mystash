@@ -104,8 +104,16 @@ remove_nginx()
 {
     systemctl stop nginx 2>/dev/null
     systemctl disable nginx 2>/dev/null
+    
+    # 清理nginx-prepare服务
+    systemctl disable nginx-prepare.service 2>/dev/null
+    rm -f /etc/systemd/system/nginx-prepare.service
+    rm -rf /etc/systemd/system/nginx.service.d
+    
     apt-get -y --allow-change-held-packages purge nginx nginx-common 2>/dev/null
     rm -rf /etc/nginx
+    systemctl daemon-reload
+    
     nginx_is_installed=0
     is_installed=0
 }
@@ -164,6 +172,40 @@ install_nginx()
     
     systemctl enable nginx
     systemctl stop nginx
+    
+    # 创建nginx-prepare服务，确保启动前创建socket目录
+    cat > /etc/systemd/system/nginx-prepare.service << 'EOF'
+[Unit]
+Description=Prepare /dev/shm/nginx directory for nginx
+Before=nginx.service
+DefaultDependencies=false
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'mkdir -p /dev/shm/nginx && chmod 755 /dev/shm/nginx'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 启用准备服务
+    systemctl enable nginx-prepare.service
+    systemctl start nginx-prepare.service
+    
+    # 修改nginx服务依赖
+    mkdir -p /etc/systemd/system/nginx.service.d
+    cat > /etc/systemd/system/nginx.service.d/override.conf << 'EOF'
+[Unit]
+After=nginx-prepare.service
+Requires=nginx-prepare.service
+
+[Service]
+ExecStartPre=
+ExecStartPre=/usr/sbin/nginx -t -q -g 'daemon on; master_process on;'
+EOF
+    
+    systemctl daemon-reload
     
     nginx_is_installed=1
     [ $xray_is_installed -eq 1 ] && is_installed=1 || is_installed=0
@@ -437,6 +479,9 @@ install_xray_tls_web()
         exit 1
     fi
     
+    # 清理可能残留的socket文件
+    rm -f /dev/shm/nginx/default.sock /dev/shm/nginx/h2.sock 2>/dev/null
+    
     sleep 2s
     # 先启动Nginx（监听unix socket），再启动Xray（监听443）
     systemctl start nginx
@@ -475,6 +520,7 @@ readDomain()
     
     local domain
     
+    echo -e "\\n\\n\\n"
     tyblue "-------请输入解析到此服务器的域名(前面不带\"http://\"或\"https://\")-------"
     
     local queren=0
@@ -538,6 +584,8 @@ check_port()
 restart_xray_tls_web()
 {
     get_config_info
+    # 清理可能残留的socket文件
+    rm -f /dev/shm/nginx/default.sock /dev/shm/nginx/h2.sock 2>/dev/null
     systemctl restart nginx
     sleep 1s
     systemctl restart xray
@@ -604,6 +652,9 @@ reset_domain()
         red "Nginx配置验证失败！"
         return 1
     fi
+    
+    # 清理可能残留的socket文件
+    rm -f /dev/shm/nginx/default.sock /dev/shm/nginx/h2.sock 2>/dev/null
     
     sleep 2s
     systemctl start nginx
@@ -716,6 +767,8 @@ start_menu()
             remove_nginx
             $HOME/.acme.sh/acme.sh --uninstall 2>/dev/null
             rm -rf $HOME/.acme.sh
+            rm -rf /etc/systemd/system/nginx.service.d
+            systemctl daemon-reload
             green "删除完成！"
             ;;
         4) restart_xray_tls_web ;;
