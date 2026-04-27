@@ -25,18 +25,8 @@ unset is_installed
 #连接配置信息
 unset domain_list
 unset true_domain_list
-unset domain_config_list
-unset pretend_list
 
-unset protocol_1
-unset protocol_2
-unset protocol_3
-unset serviceName
-unset path
 unset xid_1
-unset xid_2
-unset xid_3
-unset xray_port
 
 using_swap_now=0
 unset update
@@ -125,21 +115,13 @@ get_config_info()
 {
     [ $is_installed -eq 0 ] && return
     if [ -f $xray_config ]; then
-        # 获取Xray端口
-        xray_port="$(grep -E '"port"' $xray_config 2>/dev/null | head -1 | cut -d : -f 2 | cut -d , -f 1 | tr -d ' ')"
-        [ -z "$xray_port" ] && xray_port="16888"
-        
-        # 获取TCP协议的xid
         xid_1="$(grep '"id"' $xray_config 2>/dev/null | head -n 1 | cut -d : -f 2 | cut -d \" -f 2)"
-        protocol_1=1
     fi
     if [ -f $nginx_config ]; then
         unset domain_list
         unset true_domain_list
-        unset domain_config_list
         domain_list=($(grep "^#domain_list=" $nginx_config 2>/dev/null | cut -d = -f 2))
         true_domain_list=($(grep "^#true_domain_list=" $nginx_config 2>/dev/null | cut -d = -f 2))
-        domain_config_list=($(grep "^#domain_config_list=" $nginx_config 2>/dev/null | cut -d = -f 2))
     fi
 }
 
@@ -166,53 +148,6 @@ check_important_dependence_installed()
     fi
 }
 
-#彻底清理nginx配置
-clean_nginx_config()
-{
-    green "清理nginx配置..."
-    
-    systemctl stop nginx 2>/dev/null
-    rm -rf /etc/nginx/sites-enabled/*
-    rm -rf /etc/nginx/sites-available/*
-    rm -rf /etc/nginx/conf.d/* 2>/dev/null
-    
-    mkdir -p /etc/nginx/sites-available
-    mkdir -p /etc/nginx/sites-enabled
-    mkdir -p /etc/nginx/conf.d
-    
-    if ! grep -q "sites-enabled" /etc/nginx/nginx.conf; then
-        sed -i '/http {/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
-    fi
-    
-    cat > /etc/nginx/sites-available/default << 'EOF'
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    root /var/www/html;
-    server_name _;
-    
-    location / {
-        return 403;
-    }
-}
-EOF
-    
-    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-    
-    mkdir -p /var/www/html
-    echo "403 Forbidden" > /var/www/html/index.html
-    
-    if nginx -t; then
-        systemctl start nginx
-        green "nginx配置清理完成"
-        return 0
-    else
-        red "nginx配置测试失败"
-        nginx -t
-        return 1
-    fi
-}
-
 #安装NGINX
 install_nginx()
 {
@@ -228,7 +163,7 @@ install_nginx()
     fi
     
     systemctl enable nginx
-    clean_nginx_config
+    systemctl stop nginx
     
     nginx_is_installed=1
     [ $xray_is_installed -eq 1 ] && is_installed=1 || is_installed=0
@@ -261,11 +196,11 @@ get_cert()
     green "正在获取 \"${domain_list[0]}\" 的域名证书"
     domains="-d ${domain_list[0]}"
     
-    systemctl stop nginx
+    systemctl stop nginx 2>/dev/null
     
     if ! $HOME/.acme.sh/acme.sh --issue $domains --standalone -k ec-256 --force; then
         red "域名证书申请失败！"
-        systemctl start nginx
+        systemctl start nginx 2>/dev/null
         yellow "请检查："
         yellow "    1.域名是否解析正确"
         yellow "    2.防火墙80端口是否开放"
@@ -275,50 +210,76 @@ get_cert()
     mkdir -p ${nginx_prefix}/certs
     if ! $HOME/.acme.sh/acme.sh --installcert $domains --key-file ${nginx_prefix}/certs/${domain_list[0]}.key --fullchain-file ${nginx_prefix}/certs/${domain_list[0]}.cer --ecc; then
         red "证书安装失败！"
-        systemctl start nginx
+        systemctl start nginx 2>/dev/null
         return 1
     fi
     
-    systemctl start nginx
+    systemctl start nginx 2>/dev/null
     
     return 0
 }
 
-#配置nginx
+#配置nginx - 监听unix socket，作为fallback返回403
 config_nginx()
 {
     mkdir -p ${nginx_prefix}/conf.d
     mkdir -p ${nginx_prefix}/certs
     mkdir -p /var/www/html
+    mkdir -p /dev/shm/nginx
+    chmod 755 /dev/shm/nginx
     
     rm -f /etc/nginx/sites-enabled/*
     rm -f /etc/nginx/sites-available/*
+    rm -f ${nginx_config}
     
-    cat > /etc/nginx/sites-available/default << 'EOF'
+    # 创建xray.conf - nginx监听unix socket
+    cat > $nginx_config <<EOF
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    root /var/www/html;
+    listen unix:/dev/shm/nginx/default.sock;
+    listen unix:/dev/shm/nginx/h2.sock http2;
     server_name _;
     
     location / {
         return 403;
     }
+    
+    server_tokens off;
 }
-EOF
-    
-    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-    
-    echo "403 Forbidden" > /var/www/html/index.html
-    
-    # 保存配置信息标记
-    cat > $nginx_config << EOF
 #-----------------不要修改以下内容----------------
 #domain_list=${domain_list[@]}
 #true_domain_list=${true_domain_list[@]}
-#domain_config_list=${domain_config_list[@]}
 EOF
 
+    # 创建nginx主配置
+    cat > /etc/nginx/nginx.conf <<EOF
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 768;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+    
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+    
+    gzip on;
+    
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+    # 创建403页面
+    echo "403 Forbidden" > /var/www/html/index.html
+    
     if ! nginx -t; then
         red "Nginx配置错误！"
         nginx -t
@@ -326,12 +287,12 @@ EOF
     fi
 }
 
-#配置xray - 仅TCP+XTLS
+#配置xray - 监听443端口，fallback到nginx socket
 config_xray()
 {
     mkdir -p /usr/local/etc/xray
     mkdir -p /dev/shm/xray
-    chmod 711 /dev/shm/xray
+    chmod 755 /dev/shm/xray
     
     cat > $xray_config <<EOF
 {
@@ -340,7 +301,7 @@ config_xray()
     },
     "inbounds": [
         {
-            "port": 16888,
+            "port": 443,
             "protocol": "vless",
             "settings": {
                 "clients": [
@@ -352,7 +313,7 @@ config_xray()
                 "decryption": "none",
                 "fallbacks": [
                     {
-                        "dest": "/dev/shm/xray/fallback.sock"
+                        "dest": "/dev/shm/nginx/default.sock"
                     }
                 ]
             },
@@ -361,7 +322,6 @@ config_xray()
                 "security": "tls",
                 "tlsSettings": {
                     "alpn": [
-                        "h2",
                         "http/1.1"
                     ],
                     "minVersion": "1.2",
@@ -397,7 +357,7 @@ print_share_link()
     fi
     echo
     tyblue "分享链接："
-    echo "vless://${xid_1}@${ip}:${xray_port}?security=tls&sni=${domain_list[0]}&alpn=http%2F1.1&flow=xtls-rprx-vision"
+    echo "vless://${xid_1}@${ip}:443?security=tls&sni=${domain_list[0]}&alpn=http%2F1.1&flow=xtls-rprx-vision"
 }
 
 print_config_info()
@@ -405,7 +365,7 @@ print_config_info()
     echo -e "\\n\\n\\n"
     tyblue "==================== Xray配置信息 ===================="
     tyblue " 传输协议            ：VLESS-TCP-XTLS"
-    tyblue " Xray端口            ：${xray_port}"
+    tyblue " Xray端口            ：443"
     tyblue " 地址(域名)          ：${domain_list[0]}"
     tyblue " 用户ID(UUID)        ：${xid_1}"
     tyblue " 流控(flow)          ：xtls-rprx-vision"
@@ -414,6 +374,10 @@ print_config_info()
     tyblue " 传输层加密(security)：tls"
     tyblue " SNI(serverName)     ：${domain_list[0]}"
     tyblue "====================================================="
+    echo
+    tyblue "伪装说明："
+    tyblue "  访问 https://${domain_list[0]} 将返回403 Forbidden"
+    tyblue "  代理流量通过443端口传输，与正常HTTPS流量无法区分"
     echo
     ask_if "是否生成分享链接？(y/n)" && print_share_link
     echo
@@ -444,17 +408,11 @@ install_xray_tls_web()
     $apt -y -f install
     $apt -y full-upgrade
 
-    # 固定传输协议为TCP
-    protocol_1=1
-    protocol_2=0
-    protocol_3=0
-    
-    # 读取域名 - 自动选择方式2
+    # 读取域名
     readDomain
     
     # 生成UUID
     xid_1="$(cat /proc/sys/kernel/random/uuid)"
-    xray_port="16888"
 
     install_nginx
     
@@ -466,7 +424,7 @@ install_xray_tls_web()
     curl https://get.acme.sh | sh
     $HOME/.acme.sh/acme.sh --register-account -m my@example.com
     
-    get_all_certs
+    get_cert
 
     remove_xray
     install_update_xray
@@ -480,19 +438,22 @@ install_xray_tls_web()
     fi
     
     sleep 2s
-    systemctl restart xray nginx
+    # 先启动Nginx（监听unix socket），再启动Xray（监听443）
+    systemctl start nginx
+    sleep 1s
+    systemctl restart xray
     
-    green "-------------------安装完成-------------------"
+    # 检查服务状态
+    if systemctl -q is-active xray && systemctl -q is-active nginx; then
+        green "-------------------安装完成-------------------"
+    else
+        red "服务启动有问题，请检查日志"
+    fi
     print_config_info
     
     cd /
     rm -rf "$temp_dir"
     in_install_update_xray_tls_web=0
-}
-
-get_all_certs()
-{
-    get_cert
 }
 
 readDomain()
@@ -513,7 +474,6 @@ readDomain()
     }
     
     local domain
-    local domain_config=2  # 固定为方式2：仅某个特定域名
     
     tyblue "-------请输入解析到此服务器的域名(前面不带\"http://\"或\"https://\")-------"
     
@@ -535,7 +495,6 @@ readDomain()
     
     domain_list=("$domain")
     true_domain_list=("$domain")
-    domain_config_list=("$domain_config")
 }
 
 get_system_info()
@@ -567,13 +526,21 @@ check_port()
         exit 1
     fi
     
+    if ss -tlnp | grep -q ":443 "; then
+        red "TCP:443端口被占用！"
+        yellow "请停止占用443端口的服务后重试"
+        exit 1
+    fi
+    
     green "端口检查通过！"
 }
 
 restart_xray_tls_web()
 {
     get_config_info
-    systemctl restart xray nginx
+    systemctl restart nginx
+    sleep 1s
+    systemctl restart xray
     sleep 2s
     if ! systemctl -q is-active xray; then
         red "Xray启动失败！！"
@@ -623,8 +590,11 @@ reset_domain()
     # 重新获取域名
     readDomain
     
+    # 重新生成UUID
+    xid_1="$(cat /proc/sys/kernel/random/uuid)"
+    
     # 重新申请证书
-    get_all_certs
+    get_cert
     
     # 重新配置
     config_nginx
@@ -636,7 +606,9 @@ reset_domain()
     fi
     
     sleep 2s
-    systemctl restart xray nginx
+    systemctl start nginx
+    sleep 1s
+    systemctl restart xray
     
     green "域名重置完成！！"
     print_config_info
@@ -692,12 +664,12 @@ start_menu()
     echo
     tyblue "            Nginx  ：           ${nginx_status}"
     echo
-    tyblue "        项目地址：https://github.com/kirin10000/Xray-script"
-    echo
     tyblue "================================= 注意事项 ================================="
     yellow " 1. 此脚本需要一个解析到本服务器的域名"
-    tyblue " 2. 此脚本仅支持Debian系统"
-    green " 3. 建议在纯净的系统上使用此脚本"
+    tyblue " 2. Xray监听443端口处理TLS代理流量"
+    tyblue " 3. Nginx作为fallback通过unix socket返回403页面"
+    tyblue " 4. 此脚本仅支持Debian系统"
+    green " 5. 建议在纯净的系统上使用此脚本"
     tyblue "========================================================================"
     echo
     echo
